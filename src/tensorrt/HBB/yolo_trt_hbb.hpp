@@ -6,12 +6,12 @@
 
 // Forward declarations to avoid including heavy headers in header file
 namespace nvinfer1 {
-    class IRuntime;
-    class ICudaEngine;
-    class IExecutionContext;
-}
+class IRuntime;
+class ICudaEngine;
+class IExecutionContext;
+}  // namespace nvinfer1
 
-void maintrt_run_hbb(const std::string& imagePath,
+void maintrt_run_hbb(const std::string& inputPath,
                      const std::wstring& modelPath,
                      const std::string& outputPath);
 

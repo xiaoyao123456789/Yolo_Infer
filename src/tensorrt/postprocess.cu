@@ -170,12 +170,12 @@ __global__ void nms_kernel(float* parray, int max_objects, float threshold) {
       float cy1 = (pcurrent[1] + pcurrent[3]) * 0.5f;  // 当前框中心y
       float w1 = pcurrent[2] - pcurrent[0];            // 当前框宽度
       float h1 = pcurrent[3] - pcurrent[1];            // 当前框高度
-      
-      float cx2 = (pitem[0] + pitem[2]) * 0.5f;       // 比较框中心x
-      float cy2 = (pitem[1] + pitem[3]) * 0.5f;       // 比较框中心y
-      float w2 = pitem[2] - pitem[0];                 // 比较框宽度
-      float h2 = pitem[3] - pitem[1];                 // 比较框高度
-      
+
+      float cx2 = (pitem[0] + pitem[2]) * 0.5f;  // 比较框中心x
+      float cy2 = (pitem[1] + pitem[3]) * 0.5f;  // 比较框中心y
+      float w2 = pitem[2] - pitem[0];            // 比较框宽度
+      float h2 = pitem[3] - pitem[1];            // 比较框高度
+
       float iou = box_probiou(cx1, cy1, w1, h1, 0, cx2, cy2, w2, h2, 0);
 
       // 如果IoU超过阈值，标记当前框为抑制状态
@@ -228,14 +228,15 @@ static __global__ void nms_kernel_obb(float* bboxes, int max_objects,
       float cy1 = (pcurrent[1] + pcurrent[3]) * 0.5f;  // 当前框中心y
       float w1 = pcurrent[2] - pcurrent[0];            // 当前框宽度
       float h1 = pcurrent[3] - pcurrent[1];            // 当前框高度
-      
-      float cx2 = (pitem[0] + pitem[2]) * 0.5f;       // 比较框中心x
-      float cy2 = (pitem[1] + pitem[3]) * 0.5f;       // 比较框中心y
-      float w2 = pitem[2] - pitem[0];                 // 比较框宽度
-      float h2 = pitem[3] - pitem[1];                 // 比较框高度
-      
+
+      float cx2 = (pitem[0] + pitem[2]) * 0.5f;  // 比较框中心x
+      float cy2 = (pitem[1] + pitem[3]) * 0.5f;  // 比较框中心y
+      float w2 = pitem[2] - pitem[0];            // 比较框宽度
+      float h2 = pitem[3] - pitem[1];            // 比较框高度
+
       // pcurrent[7]和pitem[7]分别是当前框和比较框的旋转角度
-      float iou = box_probiou(cx1, cy1, w1, h1, pcurrent[7], cx2, cy2, w2, h2, pitem[7]);
+      float iou = box_probiou(cx1, cy1, w1, h1, pcurrent[7], cx2, cy2, w2, h2,
+                              pitem[7]);
 
       // IoU阈值判断
       if (iou > threshold) {
@@ -269,40 +270,32 @@ static __global__ void decode_kernel(float* predict, int num_bboxes,
 
   // 边界检查：使用传入的num_bboxes参数而不是predict[0]
   if (position >= num_bboxes) return;
-  
-  // 调试：检查关键参数
-  if (position == 0) {
-    printf("[GPU DEBUG] decode_kernel: num_bboxes=%d, max_objects=%d, box_element=%d, num_class=%d\n", 
-           num_bboxes, max_objects, box_element, num_class);
-  }
+
+
 
   // 按照CPU版本的数据布局访问：predict[channel * num_bboxes + position]
   // 添加边界检查防止数组越界
   int base_idx = position;
   if (base_idx >= num_bboxes) {
-    if (position == 0) printf("[GPU ERROR] base_idx=%d >= num_bboxes=%d\n", base_idx, num_bboxes);
-    return;
-  }
-  
+      return;
+    }
+
   float cx = predict[0 * num_bboxes + base_idx];          // 中心x坐标
   float cy = predict[1 * num_bboxes + base_idx];          // 中心y坐标
   float w = predict[2 * num_bboxes + base_idx];           // 宽度
   float h = predict[3 * num_bboxes + base_idx];           // 高度
   float confidence = predict[4 * num_bboxes + base_idx];  // 置信度
-  
-  // 调试：检查数据有效性
-  if (position < 5) {
-    printf("[GPU DEBUG] position=%d: cx=%.3f, cy=%.3f, w=%.3f, h=%.3f, conf=%.3f\n", 
-           position, cx, cy, w, h, confidence);
-  }
-  
+
+
+
   int label = 0;  // 默认类别标签
   float max_conf = confidence;
 
   // 多类别情况：寻找置信度最高的类别
   if (num_class > 1) {
     for (int c = 1; c < num_class; ++c) {
-      float conf = predict[(4 + c) * num_bboxes + position];  // 获取第c类的置信度
+      float conf =
+          predict[(4 + c) * num_bboxes + position];  // 获取第c类的置信度
       if (conf > max_conf) {
         max_conf = conf;
         label = c;  // 更新最佳类别标签

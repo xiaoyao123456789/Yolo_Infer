@@ -1,9 +1,10 @@
 #include "yolo_trt_hbb.hpp"
 
-#include <cassert>  // 用于assert
+#include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
-#include <fstream>  // 用于std::ifstream
+#include <fstream>
 #include <iostream>
 #include <opencv2/opencv.hpp>
 
@@ -15,13 +16,60 @@
 using namespace nvinfer1;
 
 // 主要的TensorRT水平边界框(HBB)检测函数
-void maintrt_run_hbb(const std::string &imagePath,
+// 支持单张图片或批量处理（传入目录路径）
+void maintrt_run_hbb(const std::string &inputPath,
                      const std::wstring &modelPath,
                      const std::string &outputPath) {
+  // 检查输入路径是文件还是目录
+  bool isDirectory = std::filesystem::is_directory(inputPath);
+  std::vector<std::string> imageFiles;
+
+  if (isDirectory) {
+    // 批量处理：获取目录中的所有图片文件
+    std::vector<std::string> supportedExtensions = {".jpg", ".jpeg", ".png",
+                                                    ".bmp", ".tiff"};
+
+    for (const auto &entry : std::filesystem::directory_iterator(inputPath)) {
+      if (entry.is_regular_file()) {
+        std::string extension = entry.path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       ::tolower);
+
+        if (std::find(supportedExtensions.begin(), supportedExtensions.end(),
+                      extension) != supportedExtensions.end()) {
+          imageFiles.push_back(entry.path().string());
+        }
+      }
+    }
+
+    if (imageFiles.empty()) {
+      std::cout << "No image files found in directory: " << inputPath
+                << std::endl;
+      return;
+    }
+
+    std::cout << "Found " << imageFiles.size() << " image files to process"
+              << std::endl;
+
+    // 创建输出目录（如果不存在）
+    if (!std::filesystem::exists(outputPath)) {
+      std::filesystem::create_directories(outputPath);
+      std::cout << "Created output directory: " << outputPath << std::endl;
+    }
+  } else {
+    // 单张图片处理
+    if (!std::filesystem::exists(inputPath)) {
+      std::cerr << "Error: Input file does not exist: " << inputPath
+                << std::endl;
+      return;
+    }
+    imageFiles.push_back(inputPath);
+  }
+
   // 将wstring转换为string
   std::string engine_name(modelPath.begin(), modelPath.end());
 
-  // TensorRT相关变量初始化
+  // TensorRT相关变量初始化（只初始化一次）
   IRuntime *runtime = nullptr;
   ICudaEngine *engine = nullptr;
   IExecutionContext *context = nullptr;
@@ -29,34 +77,21 @@ void maintrt_run_hbb(const std::string &imagePath,
   // 反序列化引擎文件
   deserialize_engine(engine_name, &runtime, &engine, &context);
 
-  std::cout << "Engine name: " << engine_name << std::endl;
-  std::cout << "Number of bindings: " << engine->getNbBindings() << std::endl;
-  cv::Mat image = read_images(imagePath);
-
+  // 初始化CUDA资源（只初始化一次）
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreate(&stream));
   cuda_preprocess_init(max_image_size);
   auto out_dims = engine->getBindingDimensions(1);
   auto model_bboxes = out_dims.d[2];
-  for (int i = 0; i < out_dims.nbDims; i++) {
-    printf("%d ", out_dims.d[i]);
-  }
-  printf("\n");
-  printf("model_bboxes: %d\n", model_bboxes);
   float *device_buffers[2];
   float *output_buffer_host = nullptr;
   float *decode_ptr_host = nullptr;
   float *decode_ptr_device = nullptr;
 
+  // 准备缓冲区（只准备一次）
   prepare_buffer(engine, &device_buffers[0], &device_buffers[1],
                  &output_buffer_host, &decode_ptr_host, &decode_ptr_device,
                  "g");
-
-  cuda_preprocess(image.data, image.cols, image.rows, device_buffers[0],
-                  kInputW, kInputH, stream);
-  // 保存预处理结果用于调试
-  save_warpaffine_image(device_buffers[0], kInputW, kInputH,
-                        "warpaffine_result.jpg", stream);
 
   // 分配临时缓冲区保存原始输出
   auto output_dims = engine->getBindingDimensions(1);
@@ -66,183 +101,179 @@ void maintrt_run_hbb(const std::string &imagePath,
   }
   float *temp_output_host = new float[output_size];
 
-  infer(*context, stream, (void **)device_buffers, temp_output_host, 1,
-        decode_ptr_host, decode_ptr_device, model_bboxes, "g");
+  // 处理每张图片
+  int processed_count = 0;
+  int success_count = 0;
+
+  for (const auto &imagePath : imageFiles) {
+    try {
+      if (isDirectory) {
+        std::cout << "Processing [" << (processed_count + 1) << "/"
+                  << imageFiles.size() << "] "
+                  << std::filesystem::path(imagePath).filename().string()
+                  << std::endl;
+      }
+
+      // 读取图像
+      cv::Mat image = read_images(imagePath);
+      if (image.empty()) {
+        std::cerr << "Error: Could not read image: " << imagePath << std::endl;
+        processed_count++;
+        continue;
+      }
+
+      // Reset all states before each inference
+      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+
+      // Clear buffers
+      memset(decode_ptr_host, 0, (1 + 1000 * 7) * sizeof(float));
+      CUDA_CHECK(
+          cudaMemset(decode_ptr_device, 0, (1 + 1000 * 7) * sizeof(float)));
+
+      // Start timing
+      auto start_time = std::chrono::high_resolution_clock::now();
+
+      // Preprocessing
+      cuda_preprocess(image.data, image.cols, image.rows, device_buffers[0],
+                      kInputW, kInputH, stream);
+
+      // Execute inference
+      infer(*context, stream, (void **)device_buffers, temp_output_host, 1,
+            decode_ptr_host, decode_ptr_device, model_bboxes, "g", image.cols,
+            image.rows);
+
+      // End timing
+      auto end_time = std::chrono::high_resolution_clock::now();
+      auto inference_time =
+          std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
+                                                                start_time)
+              .count();
+
+      int num_detections = static_cast<int>(decode_ptr_host[0]);
+
+      // 在原图上绘制检测结果
+      cv::Mat result_image = image.clone();
+
+      int drawn_count = 0;
+      for (int i = 0; i < num_detections; i++) {
+        int base_idx = 1 + i * 7;
+
+        float x1 = decode_ptr_host[base_idx + 0];
+        float y1 = decode_ptr_host[base_idx + 1];
+        float x2 = decode_ptr_host[base_idx + 2];
+        float y2 = decode_ptr_host[base_idx + 3];
+        float conf = decode_ptr_host[base_idx + 4];
+        int cls = static_cast<int>(decode_ptr_host[base_idx + 5]);
+        int keep = static_cast<int>(decode_ptr_host[base_idx + 6]);
+
+        // 只绘制keep=1的检测框
+        if (keep == 1) {
+          cv::Rect bbox(static_cast<int>(x1), static_cast<int>(y1),
+                        static_cast<int>(x2 - x1), static_cast<int>(y2 - y1));
+          cv::rectangle(result_image, bbox, cv::Scalar(0, 255, 0), 2);
+
+          std::string label = "Det" + std::to_string(cls) + ": " +
+                              std::to_string(conf).substr(0, 4);
+          cv::putText(
+              result_image, label,
+              cv::Point(static_cast<int>(x1), static_cast<int>(y1) - 10),
+              cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
+          drawn_count++;
+        }
+      }
+
+      // 保存结果图像
+      std::string finalOutputPath;
+      if (isDirectory) {
+        // 批量处理：生成输出文件名
+        std::filesystem::path inputPath(imagePath);
+        std::string outputFileName = inputPath.stem().string() + "_result" +
+                                     inputPath.extension().string();
+        finalOutputPath =
+            (std::filesystem::path(outputPath) / outputFileName).string();
+      } else {
+        // 单张图片处理：检查outputPath是否为目录
+        if (outputPath.empty()) {
+          finalOutputPath = "result.jpg";
+        } else if (std::filesystem::is_directory(outputPath) ||
+                   outputPath.back() == '/' || outputPath.back() == '\\') {
+          // outputPath是目录，生成文件名
+          std::filesystem::path inputPath(imagePath);
+          std::string outputFileName = inputPath.stem().string() + "_result" +
+                                       inputPath.extension().string();
+          finalOutputPath =
+              (std::filesystem::path(outputPath) / outputFileName).string();
+        } else {
+          // outputPath是完整文件路径
+          finalOutputPath = outputPath;
+        }
+      }
+
+      if (cv::imwrite(finalOutputPath, result_image)) {
+        std::cout << "Inference time: " << inference_time << "ms, "
+                  << "Detections: " << drawn_count << " - " << finalOutputPath
+                  << std::endl;
+        success_count++;
+      } else {
+        std::cerr << "Error: Failed to save result to: " << finalOutputPath
+                  << std::endl;
+      }
+
+      // Ensure all GPU operations complete
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      CUDA_CHECK(cudaDeviceSynchronize());
+
+      // Reset buffer states
+      memset(decode_ptr_host, 0, (1 + 1000 * 7) * sizeof(float));
+      CUDA_CHECK(cudaMemset(decode_ptr_device, 0, (1 + 1000 * 7) * sizeof(float)));
+
+    } catch (const std::exception &e) {
+      std::cerr << "Error processing " << imagePath << ": " << e.what()
+                << std::endl;
+    }
+
+    processed_count++;
+  }
 
   // 释放临时缓冲区
   delete[] temp_output_host;
 
-  int num_detections = static_cast<int>(decode_ptr_host[0]);
-  std::cout << "Number of detections: " << num_detections << std::endl;
-
-  // 在原图上绘制检测结果
-  cv::Mat result_image = image.clone();
-
-  std::cout << "Final detections after CPU post-processing: " << num_detections
-            << std::endl;
-
-  // CPU NMS后，parray[0]是保留的检测框数量，但检测框位置没有改变
-  // 需要遍历所有检测框并检查keep标志
-  int total_boxes = 0;
-  // 先找到总的检测框数量（在NMS之前）
-  for (int i = 0; i < 1000; i++) {  // 假设最大1000个框
-    int base_idx = 1 + i * 7;
-    if (base_idx + 6 >= (1 + 1000 * 7)) break;  // 防止越界
-    float conf = decode_ptr_host[base_idx + 4];
-    if (conf <= 0) break;  // 遇到无效框就停止
-    total_boxes++;
+  if (isDirectory) {
+    std::cout << "Batch processing completed: " << success_count << "/"
+              << processed_count << " successful" << std::endl;
   }
 
-  std::cout << "Total boxes to check: " << total_boxes << std::endl;
-
-  int drawn_count = 0;
-  for (int i = 0; i < total_boxes; i++) {
-    int base_idx =
-        1 +
-        i * 7;  // CPU后处理输出7个元素: [x1, y1, x2, y2, conf, cls, keep_flag]
-
-    // CPU后处理输出格式：[x1, y1, x2, y2, conf, cls, keep_flag]
-    float x1 = decode_ptr_host[base_idx + 0];  // 左上角x坐标（已经是原图坐标）
-    float y1 = decode_ptr_host[base_idx + 1];  // 左上角y坐标（已经是原图坐标）
-    float x2 = decode_ptr_host[base_idx + 2];  // 右下角x坐标（已经是原图坐标）
-    float y2 = decode_ptr_host[base_idx + 3];  // 右下角y坐标（已经是原图坐标）
-    float conf = decode_ptr_host[base_idx + 4];                  // 置信度
-    int cls = static_cast<int>(decode_ptr_host[base_idx + 5]);   // 类别
-    int keep = static_cast<int>(decode_ptr_host[base_idx + 6]);  // keep标志
-
-    std::cout << "Box " << i << ": [" << x1 << ", " << y1 << ", " << x2 << ", "
-              << y2 << "], conf=" << conf << ", cls=" << cls
-              << ", keep=" << keep << std::endl;
-
-    // 只绘制keep=1的检测框
-    if (keep == 1) {
-      std::cout << "Drawing detection " << drawn_count << ": [" << x1 << ", "
-                << y1 << ", " << x2 << ", " << y2 << "], conf=" << conf
-                << ", cls=" << cls << std::endl;
-
-      // 绘制边界框
-      cv::Rect bbox(static_cast<int>(x1), static_cast<int>(y1),
-                    static_cast<int>(x2 - x1), static_cast<int>(y2 - y1));
-      cv::rectangle(result_image, bbox, cv::Scalar(0, 255, 0), 2);
-
-      // 绘制标签和置信度
-      std::string label = "Det" + std::to_string(cls) + ": " +
-                          std::to_string(conf).substr(0, 4);
-      cv::putText(result_image, label,
-                  cv::Point(static_cast<int>(x1), static_cast<int>(y1) - 10),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
-
-      drawn_count++;
-    }
-  }
-
-  std::cout << "Total boxes drawn: " << drawn_count << std::endl;
-
-  // 保存结果图像
-  if (!outputPath.empty()) {
-    cv::imwrite(outputPath, result_image);
-    std::cout << "Result saved to: " << outputPath << std::endl;
-  } else {
-    // 如果没有指定输出路径，保存到默认位置
-    std::string default_output = "result.jpg";
-    cv::imwrite(default_output, result_image);
-    std::cout << "Result saved to: " << default_output << std::endl;
-  }
-
-  // 清理资源 - 先确保所有CUDA操作完成
-  std::cout << "[DEBUG] Starting cleanup..." << std::endl;
+  // 清理资源
   if (stream) {
-    std::cout << "[DEBUG] Synchronizing CUDA stream..." << std::endl;
-    CUDA_CHECK(cudaStreamSynchronize(stream));  // 确保所有操作完成
-    std::cout << "[DEBUG] Destroying CUDA stream..." << std::endl;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaStreamDestroy(stream));
-    std::cout << "[DEBUG] CUDA stream destroyed successfully" << std::endl;
   }
-  std::cout << "[DEBUG] Calling cuda_preprocess_destroy..." << std::endl;
   cuda_preprocess_destroy();
-  std::cout << "[DEBUG] cuda_preprocess_destroy completed" << std::endl;
 
-  // 释放设备内存 - 先释放设备端内存
   if (decode_ptr_device) {
-    std::cout << "[DEBUG] Freeing decode_ptr_device..." << std::endl;
     CUDA_CHECK(cudaFree(decode_ptr_device));
-    std::cout << "[DEBUG] decode_ptr_device freed successfully" << std::endl;
   }
 
-  // 添加指针有效性检查
-  std::cout << "[DEBUG] device_buffers[0] pointer: " << device_buffers[0]
-            << std::endl;
-  std::cout << "[DEBUG] device_buffers[1] pointer: " << device_buffers[1]
-            << std::endl;
-
-  if (device_buffers[0] && device_buffers[0] != (float *)0xDDDDDDDD &&
-      device_buffers[0] != (float *)0xCCCCCCCC) {
-    std::cout << "[DEBUG] Freeing device_buffers[0]..." << std::endl;
+  if (device_buffers[0]) {
     CUDA_CHECK(cudaFree(device_buffers[0]));
-    std::cout << "[DEBUG] device_buffers[0] freed successfully" << std::endl;
-    device_buffers[0] = nullptr;
-  } else {
-    std::cout << "[DEBUG] device_buffers[0] is invalid, skipping..."
-              << std::endl;
   }
 
-  if (device_buffers[1] && device_buffers[1] != (float *)0xDDDDDDDD &&
-      device_buffers[1] != (float *)0xCCCCCCCC) {
-    std::cout << "[DEBUG] Freeing device_buffers[1]..." << std::endl;
+  if (device_buffers[1]) {
     CUDA_CHECK(cudaFree(device_buffers[1]));
-    std::cout << "[DEBUG] device_buffers[1] freed successfully" << std::endl;
-    device_buffers[1] = nullptr;
-  } else {
-    std::cout << "[DEBUG] device_buffers[1] is invalid, skipping..."
-              << std::endl;
   }
 
-  // 释放主机内存 - 后释放主机端内存
-  std::cout << "[DEBUG] output_buffer_host pointer: " << output_buffer_host
-            << std::endl;
-  std::cout << "[DEBUG] decode_ptr_host pointer: " << decode_ptr_host
-            << std::endl;
-
-  if (output_buffer_host && output_buffer_host != (float *)0xDDDDDDDD &&
-      output_buffer_host != (float *)0xCCCCCCCC) {
-    std::cout << "[DEBUG] Deleting output_buffer_host..." << std::endl;
+  if (output_buffer_host) {
     delete[] output_buffer_host;
-    std::cout << "[DEBUG] output_buffer_host deleted successfully" << std::endl;
-    output_buffer_host = nullptr;
-  } else {
-    std::cout << "[DEBUG] output_buffer_host is invalid, skipping..."
-              << std::endl;
   }
 
-  if (decode_ptr_host && decode_ptr_host != (float *)0xDDDDDDDD &&
-      decode_ptr_host != (float *)0xCCCCCCCC) {
-    std::cout << "[DEBUG] Deleting decode_ptr_host..." << std::endl;
-    delete[] decode_ptr_host;  // 使用delete[]释放new分配的内存
-    std::cout << "[DEBUG] decode_ptr_host deleted successfully" << std::endl;
-    decode_ptr_host = nullptr;
-  } else {
-    std::cout << "[DEBUG] decode_ptr_host is invalid, skipping..." << std::endl;
+  if (decode_ptr_host) {
+    delete[] decode_ptr_host;
   }
 
-  // 销毁TensorRT对象 - 按正确顺序销毁
-  if (context) {
-    std::cout << "[DEBUG] Destroying TensorRT context..." << std::endl;
-    context->destroy();
-    std::cout << "[DEBUG] TensorRT context destroyed successfully" << std::endl;
-  }
-  if (engine) {
-    std::cout << "[DEBUG] Destroying TensorRT engine..." << std::endl;
-    engine->destroy();
-    std::cout << "[DEBUG] TensorRT engine destroyed successfully" << std::endl;
-  }
-  if (runtime) {
-    std::cout << "[DEBUG] Destroying TensorRT runtime..." << std::endl;
-    runtime->destroy();
-    std::cout << "[DEBUG] TensorRT runtime destroyed successfully" << std::endl;
-  }
+  if (context) context->destroy();
+  if (engine) engine->destroy();
+  if (runtime) runtime->destroy();
 
-  // 确保CUDA上下文同步
-  std::cout << "[DEBUG] Final CUDA device synchronization..." << std::endl;
   CUDA_CHECK(cudaDeviceSynchronize());
-  std::cout << "[DEBUG] All cleanup completed successfully" << std::endl;
 }
