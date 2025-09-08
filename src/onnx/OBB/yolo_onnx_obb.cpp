@@ -4,103 +4,33 @@
 
 #include "utils.hpp"
 // 输入 / 输出名字
+#include <iostream>
 #include <string>
 #include <vector>
 
 /**************************************************
  * @file    yolo_onnx_obb.cpp
- * @brief   YOLOv8 OrtSessionWrapper -> 创建环境等操作
- * @author  姚
- * @date    2025-06-06
- **************************************************/
-Ort::Env& OrtSessionWrapper::get_env() {
-  static Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "yolo-obb");
-  return env;
-}
-
-OrtSessionWrapper::OrtSessionWrapper(const wchar_t* model_path) {
-  Ort::SessionOptions opts;
-  opts.SetGraphOptimizationLevel(ORT_ENABLE_EXTENDED);
-  // 如需 CUDA / TensorRT，加上对应 EP
-  OrtCUDAProviderOptions cuda_option;
-  cuda_option.device_id = 0;
-  cuda_option.arena_extend_strategy = 0;
-  cuda_option.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchExhaustive;
-  cuda_option.gpu_mem_limit = SIZE_MAX;
-  cuda_option.do_copy_in_default_stream = 1;
-  opts.AppendExecutionProvider_CUDA(cuda_option);
-  session_ = std::make_unique<Ort::Session>(get_env(), model_path, opts);
-  setup_io_info();
-}
-
-void OrtSessionWrapper::run_inference(const std::vector<float>& input_data,
-                                      std::vector<Ort::Value>& outputs) {
-  Ort::MemoryInfo mem_info =
-      Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-
-  Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-      mem_info, const_cast<float*>(input_data.data()), input_data.size(),
-      input_dims_.data(), input_dims_.size());
-
-  outputs = session_->Run(Ort::RunOptions{nullptr},
-                          input_names_ptrs_.data(),  // 输入名
-                          &input_tensor, 1, output_names_ptrs_.data(),
-                          output_names_ptrs_.size());
-}
-
-void OrtSessionWrapper::setup_io_info() {
-  Ort::AllocatorWithDefaultOptions allocator;
-
-  // Ort::Session 没有 GetInputName 方法，使用 GetInputNameAllocated 替代
-  std::cout << "input count: " << session_->GetInputCount() << std::endl;
-  for (size_t i = 0; i < session_->GetInputCount(); ++i) {
-    Ort::AllocatedStringPtr n = session_->GetInputNameAllocated(i, allocator);
-    input_names_.emplace_back(n.get());
-  }
-  for (size_t i = 0; i < session_->GetOutputCount(); ++i) {
-    Ort::AllocatedStringPtr n = session_->GetOutputNameAllocated(i, allocator);
-    output_names_.emplace_back(n.get());
-  }
-  for (auto& s : input_names_) input_names_ptrs_.push_back(s.c_str());
-  for (auto& s : output_names_) output_names_ptrs_.push_back(s.c_str());
-
-  // 输入 shape
-  Ort::TypeInfo ti = session_->GetInputTypeInfo(0);
-  auto tsi = ti.GetTensorTypeAndShapeInfo();
-  input_dims_ = tsi.GetShape();  // 可能含 -1
-
-  // 补全未知维度
-  if (input_dims_.size() == 4) {  // 默认 NCHW
-    if (input_dims_[0] <= 0) input_dims_[0] = 1;
-    if (input_dims_[1] <= 0) input_dims_[1] = 3;
-    if (input_dims_[2] <= 0) input_dims_[2] = input_height;
-    if (input_dims_[3] <= 0) input_dims_[3] = input_width;
-  }
-
-  // 调试打印
-  std::cout << "final input_dims_: " << std::endl;
-  for (auto d : input_dims_) std::cout << d << ' ';
-  std::cout << '\n';
-}
-
-/**************************************************
- * @file    yolo_onnx_obb.cpp
- * @brief   YOLOv8 process -> Ort run
+ * @brief   YOLOv8 Nms -> OBB
  * @author  姚
  * @date    2025-06-03
  **************************************************/
-void process(const wchar_t* model, std::vector<float>& inputs,
-             std::vector<Ort::Value>& outputs) {
-  try {
-    OrtSessionWrapper session(model);  // 这里如果模型加载失败就会抛
-    session.run_inference(inputs, outputs);
-    std::cout << "Inference successful!\n";
-  } catch (const Ort::Exception& e) {
-    std::cerr << "\n=== ORT EXCEPTION ===\n"
-              << "ErrorCode : " << e.GetOrtErrorCode() << '\n'
-              << "Message   : " << e.what() << "\n\n";
-    throw;  // 继续 rethrow 让 VS 保持断点
+float computeIoU(const cv::RotatedRect& rect1, const cv::RotatedRect& rect2) {
+  std::vector<cv::Point2f> intersectionPts;
+  auto result = cv::rotatedRectangleIntersection(rect1, rect2, intersectionPts);
+
+  if (result == cv::INTERSECT_NONE || intersectionPts.empty()) {
+    return 0.0f;
   }
+
+  std::vector<cv::Point2f> hull;
+  cv::convexHull(intersectionPts, hull);
+  float intersectionArea = static_cast<float>(cv::contourArea(hull));
+
+  float area1 = rect1.size.width * rect1.size.height;
+  float area2 = rect2.size.width * rect2.size.height;
+  float unionArea = area1 + area2 - intersectionArea;
+
+  return intersectionArea / unionArea;
 }
 
 /**************************************************
@@ -109,9 +39,9 @@ void process(const wchar_t* model, std::vector<float>& inputs,
  * @author  姚
  * @date    2025-06-03
  **************************************************/
-void nms(std::vector<cv::RotatedRect>& rboxes, std::vector<float>& scores,
-         float score_threshold, float nms_threshold,
-         std::vector<int>& indices) {
+void obb_nms(std::vector<cv::RotatedRect>& rboxes, std::vector<float>& scores,
+             float score_threshold, float nms_threshold,
+             std::vector<int>& indices) {
   struct BoxScore {
     cv::RotatedRect box;
     float score;
@@ -141,19 +71,7 @@ void nms(std::vector<cv::RotatedRect>& rboxes, std::vector<float>& scores,
       if (isSuppressed[j]) continue;
 
       // 计算两个旋转框的IoU
-      // 计算两个旋转矩形的交集面积
-      cv::Mat intersection_mat;
-      float intersection = 0.0f;
-      int ret = cv::rotatedRectangleIntersection(
-          boxes_scores[i].box, boxes_scores[j].box, intersection_mat);
-      if (ret != cv::INTERSECT_NONE) {
-        intersection = cv::contourArea(intersection_mat);
-      }
-      float area1 =
-          boxes_scores[i].box.size.width * boxes_scores[i].box.size.height;
-      float area2 =
-          boxes_scores[j].box.size.width * boxes_scores[j].box.size.height;
-      float iou = intersection / (area1 + area2 - intersection);
+      float iou = computeIoU(boxes_scores[i].box, boxes_scores[j].box);
 
       if (iou >= nms_threshold) {
         isSuppressed[j] = true;
@@ -175,17 +93,6 @@ void nms(std::vector<cv::RotatedRect>& rboxes, std::vector<float>& scores,
  * @author  姚
  * @date    2025-06-03
  **************************************************/
-void scale_box(cv::Rect& box, cv::Size s) {
-  float g =
-      std::min(input_width * 1.f / s.width, input_height * 1.f / s.height);
-  int pad_w = static_cast<int>((input_width - s.width * g) / 2);
-  int pad_h = static_cast<int>((input_height - s.height * g) / 2);
-
-  box.x = static_cast<int>((box.x - pad_w) / g);
-  box.y = static_cast<int>((box.y - pad_h) / g);
-  box.width = static_cast<int>(box.width / g);
-  box.height = static_cast<int>(box.height / g);
-}
 
 void scale_box(cv::RotatedRect& rb, cv::Size s) {
   float g =
@@ -229,43 +136,52 @@ void post_process(cv::Mat& origin, cv::Mat& result,
   }
 
   const float* out = outputs[0].GetTensorData<float>();
+  auto det_shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
 
-  std::vector<cv::Rect> boxes;
+  int output_numbox = det_shape[1];  // 33600
+  int det_feat_dim = det_shape[2];   // 7
+  int num_class = det_shape[2] - 4;  // 类别数
+  std::cout << "  output_numbox  " << output_numbox << std::endl;
+  std::cout << "  det_feat_dim  " << det_feat_dim << std::endl;
+
   std::vector<cv::RotatedRect> rboxes;
   std::vector<float> scores;
   std::vector<int> cls_ids;
 
   for (int i = 0; i < output_numbox; ++i) {
-    // 取分类分数
-    const float* class_ptr = out + (4 + i) + 0;  // 指向本 box 的分类起始？
-    std::vector<float> cls(num_classes);
-    for (int j = 0; j < num_classes; ++j)
-      cls[j] = *(out + (4 + j) * output_numbox + i);
+    const float* ptr = out + i * det_feat_dim;
 
-    int cid = int(std::max_element(cls.begin(), cls.end()) - cls.begin());
-    float score = cls[cid];
-    if (score < score_threshold) continue;
+    int label = 0;
+    float max_conf = ptr[4];  // 第一个类分数
 
-    float x = *(out + 0 * output_numbox + i);
-    float y = *(out + 1 * output_numbox + i);
-    float w = *(out + 2 * output_numbox + i);
-    float h = *(out + 3 * output_numbox + i);
-    float a = *(out + (4 + num_classes) * output_numbox + i);
+    for (int c = 1; c < num_class; ++c) {
+      float conf = ptr[4 + c];
+      if (conf > max_conf) {
+        max_conf = conf;
+        label = c;
+      }
+    }
 
-    cv::Rect box(int(x - 0.5f * w), int(y - 0.5f * h), int(w), int(h));
-    scale_box(box, origin.size());
-    boxes.push_back(box);
-    scores.push_back(score);
-    cls_ids.push_back(cid);
+    if (max_conf < score_threshold) continue;
+    // std::cout << "[Debug] max_conf: " << max_conf << std::endl;
 
-    cv::RotatedRect rb({x, y}, {w, h}, a * 180.f / CV_PI);
+    float cx = ptr[0];
+    float cy = ptr[1];
+    float w = ptr[2];
+    float h = ptr[3];
+    float a = ptr[4 + num_class];
+
+    cv::RotatedRect rb({cx, cy}, {w, h}, a * 180.f / CV_PI);
     scale_box(rb, origin.size());
+    scores.push_back(max_conf);
+    cls_ids.push_back(label);
     rboxes.push_back(rb);
   }
-
   std::vector<int> keep;
 
-  nms(rboxes, scores, score_threshold, nms_threshold, keep);
+  std::cout << "  rboxes.size()  " << rboxes.size() << std::endl;
+  obb_nms(rboxes, scores, score_threshold, nms_threshold, keep);
+  std::cout << "  keep.size()  " << keep.size() << std::endl;
 
   for (int idx : keep) {
     std::string label =
