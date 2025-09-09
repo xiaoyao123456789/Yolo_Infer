@@ -58,6 +58,26 @@ void cuda_nms(float* parray, float nms_threshold, int max_objects,
               cudaStream_t stream);
 
 /**
+ * @brief CUDA坐标变换函数
+ *
+ * 对解码后的检测结果执行坐标变换，将模型坐标系转换回原图坐标系。
+ * 该函数在GPU上并行处理所有检测框的坐标变换。
+ *
+ * @param parray 检测结果数组指针（设备内存）
+ *               格式：[count, bbox1, bbox2, ...]
+ *               每个bbox格式：[x1, y1, x2, y2, confidence, class_id, keep_flag]
+ * @param img_width 原始图像宽度
+ * @param img_height 原始图像高度
+ * @param input_width 模型输入宽度
+ * @param input_height 模型输入高度
+ * @param max_objects 最大对象数量
+ * @param stream CUDA流，用于异步执行
+ */
+void cuda_coordinate_transform(float* parray, int img_width, int img_height,
+                               int input_width, int input_height,
+                               int max_objects, cudaStream_t stream);
+
+/**
  * @brief CPU解码函数
  *
  * CPU版本的YOLO解码函数，处理(5, 8400)格式的网络输出
