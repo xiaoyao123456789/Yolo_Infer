@@ -38,4 +38,4 @@ void prepare_buffer(ICudaEngine* engine, float** input_buffer_device,
 void infer(IExecutionContext& context, cudaStream_t& stream, void** buffers,
            float* output, int batchsize, float* decode_ptr_host,
            float* decode_ptr_device, int model_bboxes,
-           std::string cuda_post_process);
+           std::string cuda_post_process, int img_width = 0, int img_height = 0);
