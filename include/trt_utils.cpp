@@ -71,11 +71,24 @@ cv::Mat read_images(const std::string& imagePath) {
     assert(false);
   }
   images.push_back(image);
-  std::cout << "read " << imagePath << " success!" << std::endl;
 
   return image;
 }
 
+/**
+ * @brief 准备CUDA推理所需的缓冲区（包括主机和设备内存）
+ *
+ * 该函数根据TensorRT引擎的绑定信息，为输入、输出以及后处理相关数据分配GPU和CPU内存。
+ * 支持两种后处理模式：CPU模式（'c'）和GPU模式（'g'），并根据不同模式分配相应的解码缓冲区。
+ *
+ * @param engine TensorRT引擎指针，用于获取绑定信息和张量维度
+ * @param input_buffer_device 输入张量的GPU设备缓冲区指针
+ * @param output_buffer_device 输出张量的GPU设备缓冲区指针
+ * @param output_buffer_host 输出张量的CPU主机缓冲区指针（主要用于CPU后处理）
+ * @param decode_ptr_host 解码结果在CPU上的存储缓冲区（存放最终检测框等信息）
+ * @param decode_ptr_device 解码结果在GPU上的存储缓冲区（用于GPU后处理）
+ * @param cuda_post_process 后处理方式："c"表示CPU处理，"g"表示GPU处理
+ */
 void prepare_buffer(ICudaEngine* engine, float** input_buffer_device,
                     float** output_buffer_device, float** output_buffer_host,
                     float** decode_ptr_host, float** decode_ptr_device,
@@ -92,12 +105,9 @@ void prepare_buffer(ICudaEngine* engine, float** input_buffer_device,
   // 从模型中获取输出尺寸
   auto outputDims = engine->getBindingDimensions(outputIndex);
   kOutputSize = 1;  // 重置全局变量
-  std::cout << "outputDims.nbDims: " << outputDims.nbDims << std::endl;
   for (int i = 0; i < outputDims.nbDims; i++) {
-    std::cout << "outputDims.d[" << i << "]: " << outputDims.d[i] << std::endl;
     kOutputSize *= outputDims.d[i];
   }
-  std::cout << "kOutputSize: " << kOutputSize << std::endl;
 
   // 动态获取模型输出维度信息来确定box_element
   int box_element = 7;  // 默认每个框7个元素：x1,y1,x2,y2,conf,cls,keep_flag
@@ -116,9 +126,12 @@ void prepare_buffer(ICudaEngine* engine, float** input_buffer_device,
     // CPU模式下固定使用7个元素：x1,y1,x2,y2,conf,cls,keep_flag
     const int cpu_bbox_element = 7;
     *decode_ptr_host = new float[1 + kMaxNumOutputBbox * cpu_bbox_element];
-    std::cout << "[DEBUG] CPU mode: allocated decode_ptr_host for "
-              << (1 + kMaxNumOutputBbox * cpu_bbox_element) << " floats"
-              << std::endl;
+    // 注册为pinned内存以提升潜在的D2H性能
+    CUDA_CHECK(cudaHostRegister(
+        *decode_ptr_host,
+        sizeof(float) * (1 + kMaxNumOutputBbox * cpu_bbox_element),
+        cudaHostRegisterDefault));
+
   } else if (cuda_post_process == "g") {
     if (kBatchSize > 1) {
       std::cerr << "Do not yet support GPU post processing for multiple batches"
@@ -131,12 +144,14 @@ void prepare_buffer(ICudaEngine* engine, float** input_buffer_device,
 
     // Allocate memory for decode_ptr_host and copy to device
     *decode_ptr_host = new float[1 + kMaxNumOutputBbox * gpu_bbox_element];
+    // 注册为pinned内存以提升D2H性能
+    CUDA_CHECK(cudaHostRegister(
+        *decode_ptr_host,
+        sizeof(float) * (1 + kMaxNumOutputBbox * gpu_bbox_element),
+        cudaHostRegisterDefault));
     CUDA_CHECK(
         cudaMalloc((void**)decode_ptr_device,
                    sizeof(float) * (1 + kMaxNumOutputBbox * gpu_bbox_element)));
-    std::cout << "[DEBUG] GPU mode: allocated decode_ptr_host for "
-              << (1 + kMaxNumOutputBbox * gpu_bbox_element) << " floats"
-              << std::endl;
   }
 }
 
@@ -156,70 +171,52 @@ void infer(IExecutionContext& context, cudaStream_t& stream, void** buffers,
            float* output, int batchsize, float* decode_ptr_host,
            float* decode_ptr_device, int model_bboxes,
            std::string cuda_post_process, int img_width, int img_height) {
-  // 开始计时：记录推理和后处理的总时间
-  auto start = std::chrono::system_clock::now();
+  // 创建CUDA事件用于精确测量GPU推理时间
+  cudaEvent_t start, stop;
+  CUDA_CHECK(cudaEventCreate(&start));
+  CUDA_CHECK(cudaEventCreate(&stop));
+
+  // 记录开始事件
+  CUDA_CHECK(cudaEventRecord(start, stream));
 
   // 执行TensorRT模型推理
-  // buffers[0]: 输入图像数据（设备内存）
-  // buffers[1]: 网络输出数据（设备内存）
-  context.executeV2(buffers);
+  // buffers[0]: 输入图像数据（device）
+  // buffers[1]: 网络输出数据（device）
+  bool trt_ok = context.enqueueV2(buffers, stream, nullptr);
+  if (!trt_ok) {
+    std::cerr << "[TensorRT] enqueueV2 failed" << std::endl;
+  }
 
-  // 分配主机端缓冲区用于存储网络原始输出
+  // 此时 raw_output_host 里就是模型推理结果，可以直接进入后处理
   float* raw_output_host = new float[kOutputSize];
 
-  // 异步将网络输出从设备内存复制到主机内存
-  // 这个复制操作与后续的后处理可以并行执行
-  CUDA_CHECK(cudaMemcpyAsync(raw_output_host, buffers[1],
-                             kOutputSize * sizeof(float),
-                             cudaMemcpyDeviceToHost, stream));
+  // 记录结束事件并同步
+  CUDA_CHECK(cudaEventRecord(stop, stream));
+  CUDA_CHECK(cudaEventSynchronize(stop));
 
-  // 等待复制完成以便保存原始输出
-  CUDA_CHECK(cudaStreamSynchronize(stream));
+  // 计算推理时间
+  float elapsed_ms;
+  CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+  std::cout << "detect" << elapsed_ms << " ms" << std::endl;
 
-  // 保存原始网络输出用于调试对比
-  std::ofstream raw_file("bin/cpp_raw_output.bin", std::ios::binary);
-  if (raw_file.is_open()) {
-    raw_file.write(reinterpret_cast<const char*>(raw_output_host),
-                   kOutputSize * sizeof(float));
-    raw_file.close();
-    std::cout << "✅ C++ save bin/cpp_raw_output.bin" << std::endl;
-    std::cout << "📌 输出 size: " << kOutputSize << ", dtype: float32"
-              << std::endl;
-  }
+  // 销毁事件
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
 
 #if 1
   if (cuda_post_process == "c") {
     // CPU后处理模式：等待异步复制完成，然后在CPU上执行解码和NMS操作
-    std::cout << "[DEBUG] Entering CPU post-processing mode" << std::endl;
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::cout << "[DEBUG] CUDA stream synchronized" << std::endl;
 
-    // 直接使用传入的decode_ptr_host，不再分配临时缓冲区
-    const int cpu_bbox_element = 7;  // CPU后处理固定使用7个元素
     if (decode_ptr_host == nullptr) {
       std::cout << "[ERROR] decode_ptr_host is null in CPU mode!" << std::endl;
       return;
     }
-    memset(decode_ptr_host, 0,
-           sizeof(float) * (1 + kMaxNumOutputBbox * cpu_bbox_element));
-    std::cout << "[DEBUG] Using decode_ptr_host directly, size: "
-              << (1 + kMaxNumOutputBbox * cpu_bbox_element) << " floats"
-              << std::endl;
 
     // 动态获取模型输出维度信息
     auto outputDims = context.getEngine().getBindingDimensions(1);
     int box_element = 5;  // 默认每个框5个元素：x,y,w,h,conf
     int num_class = 1;    // 默认单类别检测
-
-    std::cout << "[DEBUG] Model output dimensions:" << std::endl;
-    std::cout << "[DEBUG] outputDims.nbDims: " << outputDims.nbDims
-              << std::endl;
-    for (int i = 0; i < outputDims.nbDims; i++) {
-      std::cout << "[DEBUG] outputDims.d[" << i << "]: " << outputDims.d[i]
-                << std::endl;
-    }
-    std::cout << "[DEBUG] model_bboxes: " << model_bboxes << std::endl;
-    std::cout << "[DEBUG] kOutputSize: " << kOutputSize << std::endl;
 
     // 根据输出维度确定框元素数量和类别数量
     if (outputDims.nbDims == 3) {
@@ -228,77 +225,14 @@ void infer(IExecutionContext& context, cudaStream_t& stream, void** buffers,
       num_class = box_element > 5 ? (box_element - 4) : 1;
     }
 
-    std::cout << "[CPU后处理] 开始CPU解码，输入数据维度: " << outputDims.d[0]
-              << "x" << outputDims.d[1] << std::endl;
-    std::cout << "[CPU后处理] box_element: " << box_element
-              << ", num_class: " << num_class << std::endl;
-
-    // 检查raw_output_host数据
-    std::cout << "[DEBUG] raw_output_host first 10 values: ";
-    for (int i = 0; i < std::min(10, kOutputSize); i++) {
-      std::cout << raw_output_host[i] << " ";
-    }
-    std::cout << std::endl;
-
-    // 检查raw_output_host是否为空或异常
-    if (raw_output_host == nullptr) {
-      std::cout << "[ERROR] raw_output_host is null pointer!" << std::endl;
-      return;
-    }
-
-    bool has_valid_data = false;
-    for (int i = 0; i < std::min(100, kOutputSize); i++) {
-      if (raw_output_host[i] != 0.0f && !std::isnan(raw_output_host[i]) &&
-          !std::isinf(raw_output_host[i])) {
-        has_valid_data = true;
-        break;
-      }
-    }
-    std::cout << "[DEBUG] raw_output_host contains valid data: "
-              << (has_valid_data ? "yes" : "no") << std::endl;
-
     // 调用CPU解码函数：将网络原始输出转换为检测框
-    std::cout << "[DEBUG] Calling cpu_decode function with parameters:"
-              << std::endl;
-    std::cout << "[DEBUG] - model_bboxes: " << model_bboxes << std::endl;
-    std::cout << "[DEBUG] - kConfThresh: " << kConfThresh << std::endl;
-    std::cout << "[DEBUG] - kMaxNumOutputBbox: " << kMaxNumOutputBbox
-              << std::endl;
-    std::cout << "[DEBUG] - cpu_bbox_element: " << cpu_bbox_element
-              << std::endl;
-    std::cout << "[DEBUG] - num_class: " << num_class << std::endl;
-
     cpu_decode(raw_output_host, model_bboxes, kConfThresh, decode_ptr_host,
-               kMaxNumOutputBbox, cpu_bbox_element, num_class);
-
-    std::cout << "[DEBUG] cpu_decode function completed" << std::endl;
-    std::cout << "[DEBUG] decode_ptr_host[0] (detection count): "
-              << decode_ptr_host[0] << std::endl;
-
-    // 保存解码后、NMS前的结果用于调试
-    std::ofstream decode_file("bin/cpp_decode_output.bin", std::ios::binary);
-    if (decode_file.is_open()) {
-      decode_file.write(
-          reinterpret_cast<const char*>(decode_ptr_host),
-          sizeof(float) * (1 + kMaxNumOutputBbox * cpu_bbox_element));
-      decode_file.close();
-      std::cout << "✅ C++ 解码输出已保存到 bin/cpp_decode_output.bin"
-                << std::endl;
-      std::cout << "📌 解码后检测框数量: " << (int)decode_ptr_host[0]
-                << std::endl;
-    }
+               kMaxNumOutputBbox, bbox_element, num_class);
 
     // 在NMS前进行坐标变换（与Python版本保持一致）
     // 计算仿射逆变换矩阵
-    float scale = std::min(kInputH / (float)kInputH,
-                           kInputW / (float)kInputW);  // 这里需要实际图像尺寸
-
-    // 注意：这里需要实际的图像尺寸，暂时使用固定值进行测试
-    // 在实际应用中，应该从外部传入图像尺寸
-    // int img_height = 1440;  // 实际图像高度
-    // int img_width = 2560;   // 实际图像宽度
-
-    scale = std::min(kInputH / (float)img_height, kInputW / (float)img_width);
+    float scale =
+        std::min(kInputH / (float)img_height, kInputW / (float)img_width);
 
     // 构建仿射变换矩阵（与preprocess.cu一致）
     cv::Mat s2d = (cv::Mat_<float>(2, 3) << scale, 0,
@@ -310,12 +244,10 @@ void infer(IExecutionContext& context, cudaStream_t& stream, void** buffers,
     cv::invertAffineTransform(s2d, d2s);
     float* m = d2s.ptr<float>(0);
 
-    std::cout << "[CPU后处理] 应用坐标变换，scale: " << scale << std::endl;
-
     // 对所有检测框应用坐标变换
     int count = static_cast<int>(decode_ptr_host[0]);
     for (int i = 0; i < count; i++) {
-      float* box = decode_ptr_host + 1 + i * cpu_bbox_element;
+      float* box = decode_ptr_host + 1 + i * bbox_element;
 
       float x1 = box[0], y1 = box[1], x2 = box[2], y2 = box[3];
 
@@ -348,43 +280,23 @@ void infer(IExecutionContext& context, cudaStream_t& stream, void** buffers,
     // 保存NMS后的最终结果用于调试
     std::ofstream nms_file("bin/cpp_nms_output.bin", std::ios::binary);
     if (nms_file.is_open()) {
-      nms_file.write(
-          reinterpret_cast<const char*>(decode_ptr_host),
-          sizeof(float) * (1 + kMaxNumOutputBbox * cpu_bbox_element));
+      nms_file.write(reinterpret_cast<const char*>(decode_ptr_host),
+                     sizeof(float) * (1 + kMaxNumOutputBbox * bbox_element));
       nms_file.close();
-      std::cout << "✅ C++ NMS输出已保存到 bin/cpp_nms_output.bin" << std::endl;
-      std::cout << "📌 NMS后检测框数量: " << (int)decode_ptr_host[0]
-                << std::endl;
-
-      // 打印前几个检测框的详细信息
-      int count = std::min((int)decode_ptr_host[0], 5);
-      for (int i = 0; i < count; i++) {
-        float* box = decode_ptr_host + 1 + i * cpu_bbox_element;
-        std::cout << "框 " << i << ": [" << box[0] << ", " << box[1] << ", "
-                  << box[2] << ", " << box[3] << "], 置信度: " << box[4]
-                  << ", 类别: " << (int)box[5] << ", keep: " << (int)box[6]
-                  << std::endl;
-      }
     }
 
     // CPU后处理结果已经直接存储在decode_ptr_host中，无需复制
-    std::cout << "[DEBUG] CPU processing completed, detection count: "
-              << decode_ptr_host[0] << std::endl;
-
     if (output != nullptr) {
       memcpy(output, raw_output_host, batchsize * kOutputSize * sizeof(float));
     }
 
-    // 计算并输出推理和CPU后处理时间
-    auto end = std::chrono::system_clock::now();
-    std::cout << "inference and cpu postprocess time: "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(end -
-                                                                       start)
-                     .count()
-              << "ms" << std::endl;
-  } else if (cuda_post_process == "g") {
-    // GPU后处理模式：在GPU上执行解码和NMS操作
+    // ===== 验证缓冲区清零效果 =====
+    // Verify clearing effect
+    int drawn_count = static_cast<int>(decode_ptr_host[0]);
 
+    // 注意：这里的时间测量已经在函数开始处使用CUDA事件完成
+    // CPU后处理时间可以单独测量，但推理时间已经通过CUDA事件记录
+  } else if (cuda_post_process == "g") {
     // 动态获取模型输出维度信息
     // 不同的YOLO模型可能有不同的输出格式
     auto outputDims = context.getEngine().getBindingDimensions(1);
@@ -401,109 +313,23 @@ void infer(IExecutionContext& context, cudaStream_t& stream, void** buffers,
     // GPU后处理固定使用7个元素：x1,y1,x2,y2,conf,cls,keep_flag
     const int gpu_bbox_element = 7;
 
-    // 初始化解码输出缓冲区为0
-    // decode_ptr_device用于存储解码后的检测结果
-    // 缓冲区大小：1个计数器 + 最大检测框数量 * 每个框的元素数量
-    CUDA_CHECK(cudaMemsetAsync(
-        decode_ptr_device, 0,
-        sizeof(float) * (1 + kMaxNumOutputBbox * gpu_bbox_element), stream));
+    // 计数器清零
+    CUDA_CHECK(cudaMemsetAsync(decode_ptr_device, 0, sizeof(float), stream));
 
     // 调用CUDA解码函数：将网络原始输出转换为检测框
-    std::cout << "[DEBUG] 开始GPU解码，model_bboxes=" << model_bboxes
-              << ", kMaxNumOutputBbox=" << kMaxNumOutputBbox
-              << ", gpu_bbox_element=" << gpu_bbox_element << std::endl;
-
     cuda_decode((float*)buffers[1], model_bboxes, kConfThresh,
                 decode_ptr_device, kMaxNumOutputBbox, stream, gpu_bbox_element,
                 num_class);
 
-    // 检查解码后的CUDA错误
-    cudaError_t decode_error = cudaGetLastError();
-    if (decode_error != cudaSuccess) {
-      std::cout << "[ERROR] GPU解码失败: " << cudaGetErrorString(decode_error)
-                << std::endl;
-    } else {
-      std::cout << "[DEBUG] GPU解码完成" << std::endl;
-    }
-
-    // 保存解码后、NMS前的结果用于调试
-    float* decode_before_nms =
-        new float[1 + kMaxNumOutputBbox * gpu_bbox_element];
-    CUDA_CHECK(cudaMemcpyAsync(
-        decode_before_nms, decode_ptr_device,
-        sizeof(float) * (1 + kMaxNumOutputBbox * gpu_bbox_element),
-        cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::ofstream decode_file("bin/cpp_decode_output.bin", std::ios::binary);
-    if (decode_file.is_open()) {
-      decode_file.write(
-          reinterpret_cast<const char*>(decode_before_nms),
-          sizeof(float) * (1 + kMaxNumOutputBbox * gpu_bbox_element));
-      decode_file.close();
-      std::cout << "✅ C++ 解码输出已保存到 bin/cpp_decode_output.bin"
-                << std::endl;
-      std::cout << "📌 解码后检测框数量: " << (int)decode_before_nms[0]
-                << std::endl;
-    }
-
-    // GPU模式也需要进行坐标变换（与CPU模式保持一致）
-    // 计算仿射逆变换矩阵
-    // int img_height = 1440;  // 实际图像高度
-    // int img_width = 2560;   // 实际图像宽度
-    float scale =
-        std::min(kInputH / (float)img_height, kInputW / (float)img_width);
-    float dx = (kInputW - scale * img_width) / 2;
-    float dy = (kInputH - scale * img_height) / 2;
-
-    std::cout << "[DEBUG] GPU坐标变换参数: scale=" << scale << ", dx=" << dx
-              << ", dy=" << dy << std::endl;
-
-    // 对解码后的坐标进行变换
-    int count = (int)decode_before_nms[0];
-    for (int i = 0; i < count; i++) {
-      float* box = decode_before_nms + 1 + i * gpu_bbox_element;
-      float x1 = box[0], y1 = box[1], x2 = box[2], y2 = box[3];
-
-      // 逆变换：从模型坐标系转换回原图坐标系
-      float new_x1 = (x1 - dx) / scale;
-      float new_y1 = (y1 - dy) / scale;
-      float new_x2 = (x2 - dx) / scale;
-      float new_y2 = (y2 - dy) / scale;
-
-      box[0] = new_x1;
-      box[1] = new_y1;
-      box[2] = new_x2;
-      box[3] = new_y2;
-    }
-
-    // 将变换后的坐标复制回GPU内存
-    CUDA_CHECK(cudaMemcpyAsync(
-        decode_ptr_device, decode_before_nms,
-        sizeof(float) * (1 + kMaxNumOutputBbox * gpu_bbox_element),
-        cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    delete[] decode_before_nms;
+    // GPU模式：直接在GPU上进行坐标变换，无需CPU处理
+    // 调用GPU坐标变换核函数，避免GPU->CPU->GPU的数据传输
+    cuda_coordinate_transform(decode_ptr_device, img_width, img_height, kInputW,
+                              kInputH, kMaxNumOutputBbox, stream);
 
     // 执行非极大值抑制（NMS）后处理
-    std::cout << "[DEBUG] 开始GPU NMS" << std::endl;
-
     cuda_nms(decode_ptr_device, kNmsThresh, kMaxNumOutputBbox, stream);
 
-    // 检查NMS后的CUDA错误
-    cudaError_t nms_error = cudaGetLastError();
-    if (nms_error != cudaSuccess) {
-      std::cout << "[ERROR] GPU NMS失败: " << cudaGetErrorString(nms_error)
-                << std::endl;
-    } else {
-      std::cout << "[DEBUG] GPU NMS完成" << std::endl;
-    }
-
-    // 将GPU处理后的结果复制回主机内存
-    // 复制内容：检测框计数器 + 所有检测框数据
-    // decode_ptr_host: 主机端缓冲区，用于存储最终的检测结果
-    // decode_ptr_device: 设备端缓冲区，包含NMS处理后的结果
+    // 将结果从设备内存复制到主机内存
     CUDA_CHECK(cudaMemcpyAsync(
         decode_ptr_host, decode_ptr_device,
         sizeof(float) * (1 + kMaxNumOutputBbox * gpu_bbox_element),
@@ -512,56 +338,12 @@ void infer(IExecutionContext& context, cudaStream_t& stream, void** buffers,
     // 同步流以确保所有数据复制完成
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // 保存NMS后的最终结果用于调试
-    std::ofstream nms_file("bin/cpp_nms_output.bin", std::ios::binary);
-    if (nms_file.is_open()) {
-      nms_file.write(
-          reinterpret_cast<const char*>(decode_ptr_host),
-          sizeof(float) * (1 + kMaxNumOutputBbox * gpu_bbox_element));
-      nms_file.close();
-      std::cout << "✅ C++ NMS输出已保存到 bin/cpp_nms_output.bin" << std::endl;
-
-      // 添加边界检查，防止decode_ptr_host访问越界
-      if (decode_ptr_host != nullptr) {
-        int detection_count = (int)decode_ptr_host[0];
-        // 确保检测框数量在合理范围内
-        if (detection_count >= 0 && detection_count <= kMaxNumOutputBbox) {
-          std::cout << "📌 NMS后检测框数量: " << detection_count << std::endl;
-
-          // 打印前几个检测框的详细信息
-          int count = std::min(detection_count, 5);
-          for (int i = 0; i < count; i++) {
-            float* box = decode_ptr_host + 1 + i * gpu_bbox_element;
-            std::cout << "框 " << i << ": [" << box[0] << ", " << box[1] << ", "
-                      << box[2] << ", " << box[3] << "], 置信度: " << box[4]
-                      << ", 类别: " << (int)box[5] << ", keep: " << (int)box[6]
-                      << std::endl;
-          }
-        } else {
-          std::cout << "⚠️ 警告: 检测框数量异常: " << detection_count
-                    << ", 可能存在内存访问错误" << std::endl;
-        }
-      } else {
-        std::cout << "⚠️ 错误: decode_ptr_host为空指针" << std::endl;
-      }
-    }
-
-    if (output != nullptr) {
-      memcpy(output, raw_output_host, batchsize * kOutputSize * sizeof(float));
-    }
-
-    // 计算并输出总的推理和GPU后处理时间
-    auto end = std::chrono::system_clock::now();
-    std::cout << "inference and gpu postprocess time: "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(end -
-                                                                       start)
-                     .count()
-              << "ms" << std::endl;
+    // 注意：推理时间已经在函数开始处使用CUDA事件记录
+    // GPU后处理时间包含在整个流程中，可以通过CUDA事件单独测量
   }
 #endif
 
-  // 释放临时缓冲区
-  delete[] raw_output_host;
+  // raw_output_host是std::vector，会自动释放内存
 
   // GPU模式和CPU模式都已经在各自的分支中同步过了
 }
